@@ -133,36 +133,35 @@ type repoSync struct {
 	appTokenExpiry time.Time     // time when github app auth token expires
 }
 
-// GetRef returns the current ref in a thread-safe manner
+// GetRef returns the current ref in a thread-safe manner.
 func (git *repoSync) GetRef() string {
 	git.refMu.RLock()
 	defer git.refMu.RUnlock()
 	return git.ref
 }
 
-// SetRef updates the ref in a thread-safe manner and persists it to git config
+// SetRef updates the ref in a thread-safe manner and persists it to git config.
 func (git *repoSync) SetRef(ctx context.Context, newRef string) error {
 	git.refMu.Lock()
 	defer git.refMu.Unlock()
 	git.ref = newRef
 
-	// Persist to git config so it survives restarts
+	// Persist to git config so it survives restarts.
 	if _, _, err := git.Run(ctx, git.root, "config", "git-sync.ref", newRef); err != nil {
 		return fmt.Errorf("failed to persist ref to git config: %w", err)
 	}
 	return nil
 }
 
-// LoadPersistedRef loads the ref from git config if it exists
-func (git *repoSync) LoadPersistedRef(ctx context.Context) (string, error) {
+// LoadPersistedRef loads the ref from git config if it exists.
+func (git *repoSync) LoadPersistedRef(ctx context.Context) string {
 	stdout, _, err := git.Run(ctx, git.root, "config", "--get", "git-sync.ref")
 	if err != nil {
-		// Config key doesn't exist or git repo not initialized yet
-		return "", nil
+		// Config key doesn't exist or git repo not initialized yet.
+		return ""
 	}
 
-	ref := strings.TrimSpace(stdout)
-	return ref, nil
+	return strings.TrimSpace(stdout)
 }
 
 func main() {
@@ -870,13 +869,13 @@ func main() {
 			w.Header().Set("Content-Type", "application/json")
 
 			switch r.Method {
-			case "GET":
+			case http.MethodGet:
 				currentRef := git.GetRef()
 				json.NewEncoder(w).Encode(map[string]string{
 					"ref": currentRef,
 				})
 
-			case "POST", "PUT":
+			case http.MethodPost, http.MethodPut:
 				var req struct {
 					Ref string `json:"ref"`
 				}
@@ -1016,9 +1015,7 @@ func main() {
 	// This allows ref changes via API to persist across restarts.
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if persistedRef, err := git.LoadPersistedRef(ctx); err != nil {
-			log.Error(err, "failed to load persisted ref")
-		} else if persistedRef != "" && persistedRef != git.GetRef() {
+		if persistedRef := git.LoadPersistedRef(ctx); persistedRef != "" && persistedRef != git.GetRef() {
 			git.refMu.Lock()
 			git.ref = persistedRef
 			git.refMu.Unlock()
