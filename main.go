@@ -335,7 +335,7 @@ func main() {
 		envBool(false, "GITSYNC_HTTP_PPROF", "GIT_SYNC_HTTP_PPROF"),
 		"enable the pprof debug endpoints on git-sync's HTTP endpoint")
 	flHTTPAuthToken := pflag.String("http-auth-token",
-		envString("", "GITSYNC_HTTP_AUTH_TOKEN"),
+		envString("", "GITSYNC_HTTP_AUTH_TOKEN", "GIT_SYNC_HTTP_AUTH_TOKEN"),
 		"authorization token for protected HTTP endpoints (empty disables auth)")
 
 	// Obsolete flags, kept for compat.
