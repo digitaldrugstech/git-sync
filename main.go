@@ -119,6 +119,7 @@ type repoSync struct {
 	root           absPath        // absolute path to the root directory
 	repo           string         // remote repo to sync
 	ref            string         // the ref to sync
+	refMu          sync.RWMutex   // protects ref for thread-safe access
 	depth          int            // for shallow sync
 	submodules     submodulesMode // how to handle submodules
 	gc             gcMode         // garbage collection
@@ -130,6 +131,38 @@ type repoSync struct {
 	run            cmd.Runner
 	staleTimeout   time.Duration // time for worktrees to be cleaned up
 	appTokenExpiry time.Time     // time when github app auth token expires
+}
+
+// GetRef returns the current ref in a thread-safe manner
+func (git *repoSync) GetRef() string {
+	git.refMu.RLock()
+	defer git.refMu.RUnlock()
+	return git.ref
+}
+
+// SetRef updates the ref in a thread-safe manner and persists it to git config
+func (git *repoSync) SetRef(ctx context.Context, newRef string) error {
+	git.refMu.Lock()
+	defer git.refMu.Unlock()
+	git.ref = newRef
+
+	// Persist to git config so it survives restarts
+	if _, _, err := git.Run(ctx, git.root, "config", "git-sync.ref", newRef); err != nil {
+		return fmt.Errorf("failed to persist ref to git config: %w", err)
+	}
+	return nil
+}
+
+// LoadPersistedRef loads the ref from git config if it exists
+func (git *repoSync) LoadPersistedRef(ctx context.Context) (string, error) {
+	stdout, _, err := git.Run(ctx, git.root, "config", "--get", "git-sync.ref")
+	if err != nil {
+		// Config key doesn't exist or git repo not initialized yet
+		return "", nil
+	}
+
+	ref := strings.TrimSpace(stdout)
+	return ref, nil
 }
 
 func main() {
@@ -302,6 +335,9 @@ func main() {
 	flHTTPprof := pflag.Bool("http-pprof",
 		envBool(false, "GITSYNC_HTTP_PPROF", "GIT_SYNC_HTTP_PPROF"),
 		"enable the pprof debug endpoints on git-sync's HTTP endpoint")
+	flHTTPAuthToken := pflag.String("http-auth-token",
+		envString("", "GITSYNC_HTTP_AUTH_TOKEN"),
+		"authorization token for protected HTTP endpoints (empty disables auth)")
 
 	// Obsolete flags, kept for compat.
 	flDeprecatedBranch := pflag.String("branch", envString("", "GIT_SYNC_BRANCH"),
@@ -819,6 +855,72 @@ func main() {
 			reasons = append(reasons, "pprof")
 		}
 
+		// Ref management endpoint
+		mux.HandleFunc("/api/v1/ref", func(w http.ResponseWriter, r *http.Request) {
+			// Check authorization if token is configured
+			if *flHTTPAuthToken != "" {
+				authHeader := r.Header.Get("Authorization")
+				expectedAuth := "Bearer " + *flHTTPAuthToken
+				if authHeader != expectedAuth {
+					http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+					return
+				}
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+
+			switch r.Method {
+			case "GET":
+				currentRef := git.GetRef()
+				json.NewEncoder(w).Encode(map[string]string{
+					"ref": currentRef,
+				})
+
+			case "POST", "PUT":
+				var req struct {
+					Ref string `json:"ref"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(map[string]string{
+						"error": "invalid JSON body",
+					})
+					return
+				}
+
+				if req.Ref == "" {
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(map[string]string{
+						"error": "ref field is required",
+					})
+					return
+				}
+
+				if err := git.SetRef(r.Context(), req.Ref); err != nil {
+					log.Error(err, "failed to update ref via HTTP API", "newRef", req.Ref)
+					w.WriteHeader(http.StatusInternalServerError)
+					json.NewEncoder(w).Encode(map[string]string{
+						"error": fmt.Sprintf("failed to persist ref: %v", err),
+					})
+					return
+				}
+
+				log.V(0).Info("ref updated via HTTP API", "newRef", req.Ref)
+
+				json.NewEncoder(w).Encode(map[string]string{
+					"ref":     req.Ref,
+					"message": "ref updated successfully",
+				})
+
+			default:
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				json.NewEncoder(w).Encode(map[string]string{
+					"error": "method not allowed",
+				})
+			}
+		})
+		reasons = append(reasons, "ref-api")
+
 		log.V(0).Info("serving HTTP", "endpoint", *flHTTPBind, "reasons", reasons)
 		go func() {
 			err := http.Serve(ln, mux)
@@ -910,6 +1012,21 @@ func main() {
 		return nil
 	}
 
+	// Check if a ref was previously set via API and persisted to git config.
+	// This allows ref changes via API to persist across restarts.
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if persistedRef, err := git.LoadPersistedRef(ctx); err != nil {
+			log.Error(err, "failed to load persisted ref")
+		} else if persistedRef != "" && persistedRef != git.GetRef() {
+			git.refMu.Lock()
+			git.ref = persistedRef
+			git.refMu.Unlock()
+			log.V(0).Info("loaded persisted ref from git config", "ref", persistedRef)
+		}
+		cancel()
+	}
+
 	failCount := 0
 	syncCount := uint64(0)
 	for {
@@ -976,8 +1093,8 @@ func main() {
 				os.Exit(exitCode)
 			}
 
-			if hash == git.ref {
-				log.V(0).Info("ref appears to be a git hash, no further sync needed", "ref", git.ref)
+			if hash == git.GetRef() {
+				log.V(0).Info("ref appears to be a git hash, no further sync needed", "ref", git.GetRef())
 				log.DeleteErrorFile()
 				sleepForever()
 			}
@@ -1740,7 +1857,7 @@ func (git *repoSync) SyncRepo(ctx context.Context, refreshCreds func(context.Con
 
 	// This should be very fast if we already have the hash we need. Parameters
 	// like depth are set at fetch time.
-	if err := git.fetch(ctx, git.ref); err != nil {
+	if err := git.fetch(ctx, git.GetRef()); err != nil {
 		return false, "", err
 	}
 
@@ -1774,7 +1891,7 @@ func (git *repoSync) SyncRepo(ctx context.Context, refreshCreds func(context.Con
 	// We have to do at least one fetch, to ensure that parameters like depth
 	// are set properly.  This is cheap when we already have the target hash.
 	if changed || git.syncCount == 0 {
-		git.log.V(0).Info("update required", "ref", git.ref, "local", currentHash, "remote", remoteHash, "syncCount", git.syncCount)
+		git.log.V(0).Info("update required", "ref", git.GetRef(), "local", currentHash, "remote", remoteHash, "syncCount", git.syncCount)
 		metricFetchCount.Inc()
 
 		// Reset the repo (note: not the worktree - that happens later) to the new
@@ -1820,7 +1937,7 @@ func (git *repoSync) SyncRepo(ctx context.Context, refreshCreds func(context.Con
 		// Mark ourselves as "ready".
 		setRepoReady()
 		git.syncCount++
-		git.log.V(0).Info("updated successfully", "ref", git.ref, "remote", remoteHash, "syncCount", git.syncCount)
+		git.log.V(0).Info("updated successfully", "ref", git.GetRef(), "remote", remoteHash, "syncCount", git.syncCount)
 
 		// Regular cleanup will happen in the outer loop, to catch stale
 		// worktrees.
@@ -1834,7 +1951,7 @@ func (git *repoSync) SyncRepo(ctx context.Context, refreshCreds func(context.Con
 			os.RemoveAll(currentWorktree.Path().String())
 		}
 	} else {
-		git.log.V(2).Info("update not required", "ref", git.ref, "remote", remoteHash, "syncCount", git.syncCount)
+		git.log.V(2).Info("update not required", "ref", git.GetRef(), "remote", remoteHash, "syncCount", git.syncCount)
 	}
 
 	return changed, remoteHash, nil
